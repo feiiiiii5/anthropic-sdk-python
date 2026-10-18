@@ -1,14 +1,22 @@
 from __future__ import annotations
 
-from typing import Any, TypeVar, Iterator, AsyncIterator
+import os
+from typing import Any, TypeVar, Iterator, AsyncIterator, get_args
+from collections.abc import Iterable
 from typing_extensions import override
 
 import httpx2
 import pytest
+from respx import MockRouter
 
 from anthropic import Anthropic, AsyncAnthropic
+from anthropic._compat import PYDANTIC_V1
 from anthropic._streaming import Stream, AsyncStream, ServerSentEvent
 from anthropic._exceptions import APIStatusError
+from anthropic.types.beta.sessions import BetaManagedAgentsStreamSessionEvents
+from anthropic.types.beta.sessions.beta_managed_agents_stream_session_thread_events import (
+    BetaManagedAgentsStreamSessionThreadEvents,
+)
 
 from .utils import (
     STREAMS,
@@ -24,6 +32,8 @@ from .utils import (
 )
 
 _T = TypeVar("_T")
+
+base_url = os.environ.get("TEST_API_BASE_URL", "http://127.0.0.1:4010")
 
 
 @pytest.mark.asyncio
@@ -354,6 +364,91 @@ def test_isinstance_check(client: Anthropic, async_client: AsyncAnthropic) -> No
 
     sync_stream = Stream(cast_to=object, client=client, response=httpx2.Response(200, content=b"foo"))
     assert isinstance(sync_stream, Stream)
+
+
+def stream_event_types(events: Any) -> list[str]:
+    """The `type` literal of every variant of a generated stream-events union."""
+    return [get_args(variant.model_fields["type"].annotation)[0] for variant in get_args(get_args(events)[0])]
+
+
+def stream_event_body(event_types: Iterable[str]) -> bytes:
+    """One SSE frame per event type, carrying only what it takes to decode the frame."""
+    return "".join(f'event: {type_}\ndata: {{"type": "{type_}"}}\n\n' for type_ in event_types).encode()
+
+
+def assert_all_event_types_reach_the_caller(event_types: list[str], delivered: list[str]) -> None:
+    assert delivered == event_types, (
+        "An event type that the generated union declares did not reach the caller, because the SSE event-name "
+        "filter in Stream.__stream__ / AsyncStream.__stream__ (src/anthropic/_streaming.py) does not list it. "
+        "A name the filter does not list is dropped with no error."
+    )
+
+
+@pytest.mark.skipif(PYDANTIC_V1, reason="reads the fields of pydantic v2 models")
+@pytest.mark.parametrize("client", [False], indirect=True)
+@pytest.mark.respx(base_url=base_url)
+def test_session_stream_delivers_every_event_type_it_declares(client: Anthropic, respx_mock: MockRouter) -> None:
+    # tripwire: a new event type in the union needs its name in the SSE event-name filter too
+    event_types = stream_event_types(BetaManagedAgentsStreamSessionEvents)
+    respx_mock.get("/v1/sessions/sess_1/events/stream").mock(
+        return_value=httpx2.Response(200, content=stream_event_body(event_types))
+    )
+
+    with client.beta.sessions.events.stream(session_id="sess_1") as stream:
+        delivered = [event.type for event in stream]
+
+    assert_all_event_types_reach_the_caller(event_types, delivered)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(PYDANTIC_V1, reason="reads the fields of pydantic v2 models")
+@pytest.mark.parametrize("async_client", [False], indirect=True)
+@pytest.mark.respx(base_url=base_url)
+async def test_async_session_stream_delivers_every_event_type_it_declares(
+    async_client: AsyncAnthropic, respx_mock: MockRouter
+) -> None:
+    event_types = stream_event_types(BetaManagedAgentsStreamSessionEvents)
+    respx_mock.get("/v1/sessions/sess_1/events/stream").mock(
+        return_value=httpx2.Response(200, content=stream_event_body(event_types))
+    )
+
+    async with await async_client.beta.sessions.events.stream(session_id="sess_1") as stream:
+        delivered = [event.type async for event in stream]
+
+    assert_all_event_types_reach_the_caller(event_types, delivered)
+
+
+@pytest.mark.skipif(PYDANTIC_V1, reason="reads the fields of pydantic v2 models")
+@pytest.mark.parametrize("client", [False], indirect=True)
+@pytest.mark.respx(base_url=base_url)
+def test_session_thread_stream_delivers_every_event_type_it_declares(client: Anthropic, respx_mock: MockRouter) -> None:
+    event_types = stream_event_types(BetaManagedAgentsStreamSessionThreadEvents)
+    respx_mock.get("/v1/sessions/sess_1/threads/thr_1/stream").mock(
+        return_value=httpx2.Response(200, content=stream_event_body(event_types))
+    )
+
+    with client.beta.sessions.threads.events.stream(session_id="sess_1", thread_id="thr_1") as stream:
+        delivered = [event.type for event in stream]
+
+    assert_all_event_types_reach_the_caller(event_types, delivered)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(PYDANTIC_V1, reason="reads the fields of pydantic v2 models")
+@pytest.mark.parametrize("async_client", [False], indirect=True)
+@pytest.mark.respx(base_url=base_url)
+async def test_async_session_thread_stream_delivers_every_event_type_it_declares(
+    async_client: AsyncAnthropic, respx_mock: MockRouter
+) -> None:
+    event_types = stream_event_types(BetaManagedAgentsStreamSessionThreadEvents)
+    respx_mock.get("/v1/sessions/sess_1/threads/thr_1/stream").mock(
+        return_value=httpx2.Response(200, content=stream_event_body(event_types))
+    )
+
+    async with await async_client.beta.sessions.threads.events.stream(session_id="sess_1", thread_id="thr_1") as stream:
+        delivered = [event.type async for event in stream]
+
+    assert_all_event_types_reach_the_caller(event_types, delivered)
 
 
 async def to_aiter(iter: Iterator[bytes]) -> AsyncIterator[bytes]:
